@@ -6,7 +6,7 @@ with open('README.md') as f:
 setup(
   name = 'gsmHat',
   packages = ['gsmHat'],
-  version = '0.4.2',
+  version = '0.4.3',
   license='MIT',
   description = 'Using the Waveshare GSM/GPRS/GNSS Hat for Raspberry Pi with Python',
   long_description = long_description,
@@ -21,7 +21,7 @@ setup(
           'datetime'
       ],
   classifiers=[
-    'Development Status :: 3 - Alpha',      # Chose either "3 - Alpha", "4 - Beta" or "5 - Production/Stable" as the current state of your package
+    'Development Status :: 4 - Beta',      # Chose either "3 - Alpha", "4 - Beta" or "5 - Production/Stable" as the current state of your package
     'Intended Audience :: Developers',
     'Topic :: Software Development :: Build Tools',
     'License :: OSI Approved :: MIT License',
