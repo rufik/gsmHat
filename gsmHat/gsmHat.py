@@ -1,6 +1,9 @@
 #!/usr/bin/python3
 # Filename: gsmHat.py
 import logging
+import sys
+from unittest import case
+from xmlrpc.client import boolean
 import serial
 import threading
 import time
@@ -59,21 +62,41 @@ class GSMHat:
     cSMSwaittime = 2500             # milliseconds
     cGPRSstatusWaittime = 5000      # milliseconds
 
-    def __init__(self, SerialPort, Baudrate, Logpath='gmsHat.log'):
+    __ERRORS_HELP = """600 Not HTTP PDU
+601 Network Error
+602 No memory
+603 DNS Error
+604 Stack Busy
+605 SSL failed to establish channels
+606 SSL fatal result in the immediate termination of the connection"""
+
+
+    def __init__(self, SerialPort: str, Baudrate: int, Logpath: str = None):
+        """ Creates instance of class
+        :param SerialPort: Serial port, ie. /dev/ttyS0
+        :param Baudrate: Serial port baudrate, ie. 115200
+        :param Logpath: Set to None for stdout logging only. Set to file for logging into file as well.
+        """
         self.__baudrate = Baudrate
         self.__port = SerialPort
-
         self.__logger = logging.getLogger(__name__)
-        self.__logger.setLevel(logging.DEBUG)
-        self.__loggerFileHandle = logging.FileHandler(Logpath)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        self.__loggerFileHandle.setFormatter(formatter)
+        self.set_loglevel(logging.INFO)
+        if Logpath is not None:
+            self.__logger.info("Setting up logging into file %s", Logpath)
+            self.__init_file_logger(Logpath)
+        self.__connect()
+        self.__startWorking()
+
+    def __init_file_logger(self, logpath: str = 'gmsHat.log'):
+        self.__logger = logging.getLogger(__name__)
+        self.__loggerFileHandle = logging.FileHandler(logpath)
+        self.__loggerFileHandle.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
         self.__loggerFileHandle.setLevel(logging.DEBUG)
         self.__logger.addHandler(self.__loggerFileHandle)
 
-        self.__connect()
-        self.__startWorking()
-    
+    def set_loglevel(self, level: int = logging.INFO):
+        self.__logger.setLevel(level)
+
     def __connect(self):
         self.__ser = serial.Serial(self.__port, self.__baudrate)
         self.__ser.flushInput()
@@ -108,6 +131,10 @@ class GSMHat:
         self.__GPRSuserUSER = None
         self.__GPRSuserPWD = None
         self.__GPRScallUrlList = []
+        self.__httpMethod = "GET"
+        self.__httpSSL = 0
+        self.__httpContentType = None
+        self.__httpBody = None
         self.__GPRSdataReceived = []
         self.__GPRSwaitForData = False
         self.__GPSstarted = False
@@ -138,16 +165,19 @@ class GSMHat:
             time.sleep(1)
             return False
     
+    def reset(self):
+        self.__pressPowerKey()
+
     def __pressPowerKey(self):
+        self.__logger.debug("Resetting SIM868 module")
+        EN_PIN = 7
         GPIO.setmode(GPIO.BOARD)
-        GPIO.setup(7, GPIO.OUT)
-        while True:
-            GPIO.output(7, GPIO.LOW)
-            time.sleep(4)
-            GPIO.output(7, GPIO.HIGH)
-            break
+        GPIO.setup(EN_PIN, GPIO.OUT)
+        GPIO.output(EN_PIN, GPIO.LOW)
+        time.sleep(3)
+        GPIO.output(EN_PIN, GPIO.HIGH)
         GPIO.cleanup()
-        time.sleep(10)
+        time.sleep(5)
 
     def SMS_available(self):
         return len(self.__smsList)
@@ -191,17 +221,40 @@ class GSMHat:
 
         return None
 
-    def CallUrl(self, url):
+    def CallUrl(self, url: str):
+        '''Sends HTTP GET request (no ssl) using given URL.'''
+        self.__httpSSL = 0
+        self.__httpMethod = "GET"
         self.__GPRScallUrlList.append(url)
-        self.__logger.debug('Got new URL call')
+        self.__logger.debug('Got new HTTP GET (no SSL) URL call')
+
+    def CallUrl2(self, url: str, http_method: str, content_type: str, body: str, ssl: boolean):
+        """Sends HTTP request using given URL.
+        
+        :param url: URL to be called
+        :param http_method: HTTP method to be used - GET, POST, HEAD, DELETE only.
+        :param content_type: Content-Type header value to be sent. Leave empty to not to send.
+        :param body: Body, for posting only Leave empty to not to send.
+        :param ssl: True if HTTPS has to be used
+        """
+        self.__httpMethod = http_method.upper() if (http_method is not None and len(http_method) > 0) else "GET"
+        self.__httpContentType = content_type
+        self.__httpBody = body
+        self.__httpSSL = ssl
+        self.__GPRScallUrlList.append(url)
+        self.__logger.debug("Got new URL call using method={} and SSL={}".format(self.__httpMethod, self.__httpSSL))
 
     def PendingUrlCalls(self):
         return len(self.__GPRScallUrlList)
 
     def SetGPRSconnection(self, APN, Username, Password):
+        if (self.__GPRSready):
+            self.__logger.info("GPRS already set up, skipping.")
+            return
         self.__GPRSuserAPN = APN
         self.__GPRSuserUSER = Username
         self.__GPRSuserPWD = Password
+        self.__GPRSready = False
 
     def __startGPSUnit(self):
         self.__startGPS = True
@@ -219,9 +272,10 @@ class GSMHat:
         self.__collectGPSData()
 
     def close(self):
+        self.__logger.info("Stopping worker thread...")
+        self.__stopWorking()
         self.__disconnect()
         self.__logger.info('Serial connection to '+self.__port+' closed')
-        self.__stopWorking()
     
     def __processData(self):
         if self.__serData != '':
@@ -300,10 +354,11 @@ class GSMHat:
                     rawData = match[0][1].split(',')
                     self.__GPRSIPaddress = rawData[2].replace('"', '')
 
-                    if self.__GPRSIPaddress != '0.0.0.0':
-                        self.__GPRSready = True
-                    else:
-                        self.__GPRSready = False
+                    # not a real indicator
+                    # if self.__GPRSIPaddress != '0.0.0.0':
+                    #     self.__GPRSready = True
+                    # else:
+                    #     self.__GPRSready = False
 
                 elif '+HTTPREAD:' in self.__serData:
                     # read HTTP content
@@ -319,12 +374,13 @@ class GSMHat:
                         requestMethod = int(rawData[0])
                         httpStatus = int(rawData[1])
                         recvDataLength = int(rawData[2])
-                        if httpStatus == 200:  # Successful request
+                        if httpStatus >= 200 and httpStatus < 600:  # Successful request
                             self.__GPRSnewDataReceived = True
                         elif httpStatus == 601:  # Successful request
                             self.__logger.info('HTTPACTION Network Error ' + str(httpStatus))
                         else:
-                            self.__logger.info('HTTPACTION Unhandled Error ' + str(httpStatus))
+                            self.__logger.warn('HTTPACTION Unhandled Error ' + str(httpStatus))
+                            self.__logger.info("Common error codes:\r " + self.__ERRORS_HELP)
 
                     else:
                         self.__logger.info('HTTPACTION return value is not expected: ' + match[0][1])
@@ -436,12 +492,13 @@ class GSMHat:
             self.__serData = ''
 
     def __restartProcedure(self):
-        self.__logger.error('Try to restart gsm module')
+        self.__logger.warn('Try to restart gsm module')
         self.__pressPowerKey()
         self.__state = 1
         self.__writeLock = False
         self.__retryAfterTimeout = False
         self.__sentTimeout = 0
+        self.__logger.info('GSM module restart completed')
 
     def __waitForUnlock(self):
         actTime = int(round(time.time()))
@@ -472,6 +529,14 @@ class GSMHat:
                 self.__state = 2
                 self.__writeLock = False
                 self.__sentTimeout = 0
+                return False
+            elif self.__state == 612:
+                # GPRS APN already set up
+                self.__logger.warn("AT+CSTT command was unsuccessful, GPRS APN is already set up properly I guess")
+                self.__GPRSready = True
+                self.__writeLock = False
+                self.__sentTimeout = 0
+                self.__state = 97
                 return False
             else:
                 self.__logger.critical('Exception: Unhandled timeout during data reception')
@@ -628,9 +693,25 @@ class GSMHat:
                     else:
                         if self.__GPRSuserAPN != None and self.__GPRSuserUSER != None and self.__GPRSuserPWD != None:
                             # try to connect
-                            tempState = 62
-
+                            tempState = 611
                     self.__state = tempState
+
+            #set APN properly
+            elif self.__state == 611:
+                if self.__sendToHat('AT+CSTT="{}","{}","{}"'.format(self.__GPRSuserAPN, self.__GPRSuserUSER, self.__GPRSuserPWD)):
+                    self.__state = 612
+            elif self.__state == 612:
+                if self.__waitForUnlock():
+                    if self.__sendToHat('AT+CIICR'):
+                        self.__state = 613
+            elif self.__state == 613:
+                if self.__waitForUnlock():
+                    if self.__sendToHat('AT+CGATT?'):
+                        self.__state = 614
+            elif self.__state == 614:
+                if self.__waitForUnlock():
+                    if self.__sendToHat('AT+CDNSCFG?'):
+                        self.__state = 62
 
             elif self.__state == 62:
                 if self.__sendToHat('AT+SAPBR=3,1,"Contype","GPRS"'):
@@ -654,12 +735,14 @@ class GSMHat:
             elif self.__state == 66:
                 if self.__waitForUnlock():
                     if self.__sendToHat('AT+SAPBR=1,1'):
-                        self.__state = self.__state + 1
-            
+                        self.__state = 67
+
             elif self.__state == 67:
                 if self.__waitForUnlock():
+                    self.__GPRSready = True
                     self.__state = 97
 
+            # start of HTTP call here
             elif self.__state == 70:
                 # Call the first URL in List
                 if self.__sendToHat('AT+HTTPINIT'):
@@ -668,7 +751,16 @@ class GSMHat:
             elif self.__state == 71:
                 if self.__waitForUnlock():
                     if self.__sendToHat('AT+HTTPPARA="CID",1'):
-                        self.__state = self.__state + 1
+                        self.__state = 711
+
+            elif self.__state == 711:
+                if self.__httpSSL:
+                    if self.__waitForUnlock():
+                        if self.__sendToHat('AT+HTTPSSL=1'):
+                            self.__httpSSL = False
+                            self.__state = 72
+                else:
+                    self.__state = 72
 
             elif self.__state == 72:
                 if self.__waitForUnlock():
@@ -678,13 +770,34 @@ class GSMHat:
                         self.__GPRSwaitForData = True
                         self.__GPRSnewDataReceived = False
                         self.__GPRSgotHttpResponse = False
-                        self.__state = self.__state + 1
+                        self.__state = 721
+
+            elif self.__state == 721:
+                if self.__httpContentType is not None:
+                    if self.__waitForUnlock():
+                        if self.__sendToHat('AT+HTTPPARA="CONTENT","application/json"'):
+                            self.__httpContentType = None
+                            self.__state = 722
+                else:
+                    self.__state = 722
             
+            elif self.__state == 722:
+                if self.__httpBody is not None and len(self.__httpBody) > 0:
+                    if self.__waitForUnlock():
+                        if self.__sendToHat('AT+HTTPDATA=' + str(len(self.__httpBody)) + ',2000'):
+                            if self.__waitForUnlock():
+                                if self.__sendToHat(self.__httpBody):
+                                    pass
+                            self.__httpBody = None
+                            self.__state = 73
+                else:
+                    self.__state = 73
+
             elif self.__state == 73:
                 if self.__waitForUnlock():
-                    if self.__sendToHat('AT+HTTPACTION=0'):
+                    if self.__sendToHat('AT+HTTPACTION=' + str(self.__translateHTTPMethod(self.__httpMethod))):
                         self.__state = 97
-                        #self.__state = self.__state + 1
+
             
             elif self.__state == 74:
                 if self.__waitForUnlock():
@@ -717,7 +830,7 @@ class GSMHat:
                     self.__state = 20
 
                 # Check if we should call some Urls
-                elif len(self.__GPRScallUrlList) > 0 and self.__GPRSready and self.__GPRSwaitForData == False:
+                elif len(self.__GPRScallUrlList) > 0 and self.__GPRSready and self.__GPRSwaitForData is False:
                     self.__state = 70
                 
                 elif self.__GPRSwaitForData and self.__GPRSgotHttpResponse:
@@ -774,3 +887,19 @@ class GSMHat:
             # Let other Threads also do their job
             time.sleep(0.1)
         self.__logger.info('Worker ended')
+
+    def __translateHTTPMethod(self, http_method: str) -> int:
+        """Translates HTTP Method name (GET,POST,HEAD,DELETE) into numeric code"""
+        if http_method is None:
+            return 0  # GET is default
+        m = http_method.upper()
+        if m == "GET":
+            return 0
+        elif m == "POST":
+            return 1
+        elif m == "HEAD":
+            return 2
+        elif m == "DELETE":
+            return 3
+        else:
+            return 0  # GET is default
